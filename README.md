@@ -13,7 +13,7 @@
 
 1. **자동 리포트 수집** (네이버 금융 + 한경컨센서스)
 2. **키워드 자동 추출** (빈도 분석 기반)
-3. **PDF 본문 요약** (GPT-4o 기반 2-3줄 요약)
+3. **PDF 본문 요약** (GPT-5-mini 기반 2-3줄 요약)
 4. **일일 브리핑 생성** (애널리스트 스타일 종합 리포트)
 5. **Notion 자동 업로드** (페이지 + 본문 블록 생성)
 6. **GitHub Actions 자동 실행** (매일 오전 7시 KST)
@@ -83,7 +83,7 @@ cp .env.example .env
 `.env` 파일 예시:
 ```env
 OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxx
-OPENAI_MODEL_NAME=gpt-4o
+OPENAI_MODEL_NAME=gpt-5-mini
 NOTION_API_KEY=secret_xxxxxxxxxxxxxxxx
 NOTION_DATABASE_ID=xxxxxxxxxxxxxxxx
 ```
@@ -131,7 +131,7 @@ python run_daily_briefing.py
 | Secret Name          | Value 예시                          |
 |----------------------|-------------------------------------|
 | `OPENAI_API_KEY`     | `sk-proj-xxxxxxxxxxxxxxxx`          |
-| `OPENAI_MODEL_NAME`  | `gpt-4o`                            |
+| `OPENAI_MODEL_NAME`  | `gpt-5-mini`                        |
 | `NOTION_API_KEY`     | `secret_xxxxxxxxxxxxxxxx`           |
 | `NOTION_DATABASE_ID` | `xxxxxxxxxxxxxxxx`                  |
 

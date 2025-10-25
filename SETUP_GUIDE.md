@@ -7,7 +7,7 @@
 ```env
 # OpenAI API Configuration
 OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-OPENAI_MODEL_NAME=gpt-4o
+OPENAI_MODEL_NAME=gpt-5-mini
 
 # Notion API Configuration
 NOTION_API_KEY=secret_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -90,7 +90,7 @@ TZ=Asia/Seoul
 | Name                  | Value                                |
 |-----------------------|--------------------------------------|
 | `OPENAI_API_KEY`      | `.env`의 `OPENAI_API_KEY` 값         |
-| `OPENAI_MODEL_NAME`   | `gpt-4o`                             |
+| `OPENAI_MODEL_NAME`   | `gpt-5-mini`                             |
 | `NOTION_API_KEY`      | `.env`의 `NOTION_API_KEY` 값         |
 | `NOTION_DATABASE_ID`  | `.env`의 `NOTION_DATABASE_ID` 값     |
 
