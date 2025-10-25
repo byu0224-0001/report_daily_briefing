@@ -265,6 +265,14 @@ def run_daily_briefing():
     all_reports = naver_reports + hankyung_reports
     print(f"   [OK] 총 {len(all_reports)}개 리포트 수집 완료")
     
+    # 리포트가 없으면 조기 종료
+    if len(all_reports) == 0:
+        print("\n" + "="*60)
+        print("[INFO] 수집된 리포트가 없어 브리핑을 생성하지 않습니다.")
+        print("주말이나 공휴일에는 리포트가 발행되지 않을 수 있습니다.")
+        print("="*60)
+        return "[INFO] 리포트 없음 - 브리핑 미생성"
+    
     # 2. 키워드 분석
     print("\n[2/5] 키워드 분석 중...")
     analyzer = PythonAnalyzerTool()
