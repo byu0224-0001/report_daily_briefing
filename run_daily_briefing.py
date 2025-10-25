@@ -19,7 +19,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
-LLM_MODEL = os.getenv("OPENAI_MODEL_NAME", "gpt-4o")
+LLM_MODEL = os.getenv("OPENAI_MODEL_NAME", "gpt-5-mini")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -293,13 +293,32 @@ def run_daily_briefing():
     return briefing
 
 if __name__ == "__main__":
-    try:
-        result = run_daily_briefing()
-        print("\n" + "="*60)
-        print("최종 브리핑 미리보기:")
+    # ----------------------------------------------------------
+    # 주말 자동 실행 방지 (토요일=5, 일요일=6)
+    # ----------------------------------------------------------
+    weekday = datetime.today().weekday()  # 월=0, 화=1, ..., 일=6
+    IS_TEST_MODE = True  # 테스트용으로 오늘만 강제 실행하려면 True
+    
+    if weekday >= 5 and not IS_TEST_MODE:
         print("="*60)
-        print(result[:500] + "..." if len(result) > 500 else result)
-    except Exception as e:
-        print(f"\n[ERROR] 실행 중 오류 발생: {e}")
-        import traceback
-        traceback.print_exc()
+        print("[SKIP] 주말에는 리포트가 발행되지 않아 실행을 건너뜁니다.")
+        print(f"오늘: {today_display} ({['월','화','수','목','금','토','일'][weekday]}요일)")
+        print("다음 실행: 월요일 오전 7시 (KST)")
+        print("="*60)
+    else:
+        if IS_TEST_MODE and weekday >= 5:
+            print("="*60)
+            print(f"[TEST MODE] 주말이지만 테스트 모드로 실행합니다.")
+            print(f"오늘: {today_display} ({['월','화','수','목','금','토','일'][weekday]}요일)")
+            print("="*60)
+        
+        try:
+            result = run_daily_briefing()
+            print("\n" + "="*60)
+            print("최종 브리핑 미리보기:")
+            print("="*60)
+            print(result[:500] + "..." if len(result) > 500 else result)
+        except Exception as e:
+            print(f"\n[ERROR] 실행 중 오류 발생: {e}")
+            import traceback
+            traceback.print_exc()
