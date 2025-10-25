@@ -11,6 +11,13 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from crewai import Agent, Task, Crew, Process
 from crewai.tools import BaseTool
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 
 # ----------------------------------------------------------
 # 0️⃣ 환경 설정
@@ -28,8 +35,39 @@ NOTION_HEADERS = {"Authorization": f"Bearer {NOTION_API_KEY}",
                   "Notion-Version": "2022-06-28",
                   "Content-Type": "application/json"}
 
+# 날짜 설정
+from datetime import timedelta
 today_display = datetime.now().strftime("%Y.%m.%d")
 today_file = datetime.now().strftime("%Y-%m-%d")
+
+# 테스트 모드: 최근 3일치 리포트 수집 (주말 대응)
+TEST_MODE_RECENT_DAYS = False  # True: 최근 3일, False: 오늘만
+if TEST_MODE_RECENT_DAYS:
+    # 4자리 연도와 2자리 연도 둘 다 생성
+    target_dates_full = [(datetime.now() - timedelta(days=i)).strftime("%Y.%m.%d") for i in range(3)]
+    target_dates_short = [(datetime.now() - timedelta(days=i)).strftime("%y.%m.%d") for i in range(3)]
+    target_dates = target_dates_full + target_dates_short  # 둘 다 허용
+    print(f"[TEST] 최근 3일치 리포트 수집 모드: {', '.join(target_dates_full)}")
+else:
+    target_dates = [today_display, datetime.now().strftime("%y.%m.%d")]
+    print(f"[PROD] 오늘 날짜만 수집: {today_display}")
+
+# ----------------------------------------------------------
+# 🌐 Selenium 헬퍼 함수
+# ----------------------------------------------------------
+def create_selenium_driver():
+    """Selenium Chrome 드라이버 생성 (headless 모드)"""
+    chrome_options = Options()
+    chrome_options.add_argument('--headless')  # 백그라운드 실행
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--window-size=1920,1080')
+    chrome_options.add_argument(f'user-agent={HEADERS["User-Agent"]}')
+    
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    return driver
 
 # ----------------------------------------------------------
 # 1️⃣ 네이버 / 한경 리포트 수집 Tool
@@ -39,37 +77,79 @@ class NaverResearchScraperTool(BaseTool):
     description: str = "네이버 금융 리서치 리포트 수집"
     
     def _run(self) -> str:
-        """네이버 리서치 리포트 수집"""
+        """네이버 리서치 리포트 수집 (Selenium 사용)"""
         base_url = "https://finance.naver.com/research/"
         categories = {"투자정보": "invest_list.naver",
                       "종목분석": "company_list.naver",
                       "산업분석": "industry_list.naver",
                       "경제분석": "economy_list.naver"}
         reports = []
-        for cat, path in categories.items():
-            try:
-                res = requests.get(base_url + path, headers=HEADERS, timeout=10)
-                soup = BeautifulSoup(res.text, "html.parser")
-                for row in soup.select("table.type_1 tbody tr"):
-                    cols = row.find_all("td")
-                    if len(cols) < 4: continue
-                    date = cols[3].get_text(strip=True)
-                    if date != today_display: continue
-                    title_tag = cols[1].find("a")
-                    if not title_tag: continue
-                    detail_url = "https://finance.naver.com" + title_tag["href"]
-                    company = cols[2].get_text(strip=True)
-                    pdf_url = None
-                    try:
-                        d_soup = BeautifulSoup(requests.get(detail_url, headers=HEADERS).text, "html.parser")
-                        pdf_btn = d_soup.find("a", string=re.compile("리포트보기"))
-                        if pdf_btn: pdf_url = "https://finance.naver.com" + pdf_btn["href"]
-                    except: pass
-                    reports.append({"source": "네이버", "category": cat, "title": title_tag.get_text(strip=True),
-                                    "company": company, "date": date, "url": detail_url, "pdf_url": pdf_url})
-                time.sleep(1)
-            except Exception as e:
-                print(f"⚠️ 네이버 {cat} 수집 실패: {e}")
+        
+        print(f"\n[DEBUG] 네이버 수집 시작 (Selenium) - 검색 날짜: {target_dates}")
+        
+        driver = None
+        try:
+            driver = create_selenium_driver()
+            
+            for cat, path in categories.items():
+                try:
+                    url = base_url + path
+                    driver.get(url)
+                    
+                    # 페이지 로드 대기
+                    time.sleep(2)
+                    
+                    # BeautifulSoup으로 파싱
+                    soup = BeautifulSoup(driver.page_source, "html.parser")
+                    rows = soup.select("table.type_1 tbody tr")
+                    print(f"[DEBUG] {cat}: {len(rows)}개 row 발견")
+                    
+                    row_count = 0
+                    collected_in_category = 0
+                    for row in rows:
+                        cols = row.find_all("td")
+                        if len(cols) < 4: 
+                            continue
+                        
+                        # 컬럼 순서: [제목, 증권사, 제공일자, PDF] 또는 다른 구조일 수 있음
+                        title_tag = cols[0].find("a")
+                        if not title_tag:
+                            title_tag = cols[1].find("a")
+                        
+                        company = cols[1].get_text(strip=True) if len(cols) > 1 else "N/A"
+                        date = cols[-1].get_text(strip=True)  # 마지막 컬럼이 날짜일 가능성
+                        if not date or len(date) < 6:  # 날짜가 없거나 너무 짧으면
+                            date = cols[-2].get_text(strip=True) if len(cols) > 2 else ""
+                        
+                        if row_count < 3:  # 처음 3개만 출력
+                            title_text = title_tag.get_text(strip=True)[:30] if title_tag else 'N/A'
+                            print(f"   - [{date}] {title_text}... (컬럼수: {len(cols)})")
+                        row_count += 1
+                        
+                        # 날짜 필터: target_dates 목록에 있는 날짜만 수집
+                        if date not in target_dates:
+                            continue
+                        
+                        if not title_tag: continue
+                        detail_url = "https://finance.naver.com" + title_tag.get("href", "")
+                        pdf_url = None
+                        try:
+                            d_soup = BeautifulSoup(requests.get(detail_url, headers=HEADERS).text, "html.parser")
+                            pdf_btn = d_soup.find("a", string=re.compile("리포트보기"))
+                            if pdf_btn: pdf_url = "https://finance.naver.com" + pdf_btn["href"]
+                        except: pass
+                        reports.append({"source": "네이버", "category": cat, "title": title_tag.get_text(strip=True),
+                                        "company": company, "date": date, "url": detail_url, "pdf_url": pdf_url})
+                        collected_in_category += 1
+                    
+                    print(f"   [OK] {cat}: {collected_in_category}개 수집 완료")
+                    time.sleep(1)
+                except Exception as e:
+                    print(f"⚠️ 네이버 {cat} 수집 실패: {e}")
+        finally:
+            if driver:
+                driver.quit()
+        
         return str(reports)
 
 class HankyungScraperTool(BaseTool):
@@ -81,23 +161,51 @@ class HankyungScraperTool(BaseTool):
         url = "https://consensus.hankyung.com/analysis/list"
         reports = []
         try:
+            print(f"\n[DEBUG] 한경 수집 시작 - 검색 날짜: {target_dates[:3]}")
             res = requests.get(url, headers=HEADERS, timeout=10)
             soup = BeautifulSoup(res.text, "html.parser")
-            for row in soup.select("table tbody tr"):
+            rows = soup.select("table tbody tr")
+            print(f"[DEBUG] 한경: {len(rows)}개 row 발견")
+            
+            row_count = 0
+            collected_count = 0
+            for row in rows:
                 cols = row.find_all("td")
-                if len(cols) < 4: continue
-                date = cols[3].get_text(strip=True).replace("-", ".")
-                if date != today_display: continue
+                if len(cols) < 4: 
+                    continue
+                    
+                date_raw = cols[3].get_text(strip=True)
+                # 날짜 형식 통일 (YYYY-MM-DD → YYYY.MM.DD, YY-MM-DD → YY.MM.DD)
+                date = date_raw.replace("-", ".")
+                
                 title_tag = cols[0].find("a")
+                title_text = title_tag.get_text(strip=True)[:30] if title_tag else 'N/A'
+                
+                if row_count < 3:  # 처음 3개만 출력
+                    print(f"   - [{date}] {title_text}... (컬럼수: {len(cols)})")
+                row_count += 1
+                
+                # 날짜 필터: target_dates 목록에 있는 날짜만 수집
+                if date not in target_dates:
+                    continue
+                
+                if not title_tag:
+                    continue
+                    
                 pdf_tag = row.find("a", href=re.compile(r"\.pdf$"))
                 pdf_url = "https://consensus.hankyung.com" + pdf_tag["href"] if pdf_tag else None
                 reports.append({"source": "한경컨센서스", "category": cols[2].get_text(strip=True),
                                 "title": title_tag.get_text(strip=True), "company": cols[1].get_text(strip=True),
                                 "date": date, "url": "https://consensus.hankyung.com" + title_tag["href"],
                                 "pdf_url": pdf_url})
-                time.sleep(1)
+                collected_count += 1
+                time.sleep(0.5)
+            
+            print(f"   [OK] 한경: {collected_count}개 수집 완료")
         except Exception as e:
             print(f"⚠️ 한경 수집 실패: {e}")
+            import traceback
+            traceback.print_exc()
         return str(reports)
 
 # ----------------------------------------------------------
@@ -135,7 +243,9 @@ class ReportSummarizerTool(BaseTool):
         try:
             reports = eval(reports_str)
             summaries = []
-            for r in reports[:5]:  # 최대 5개만 테스트
+            # 테스트 모드: 최대 3개만 요약 (시간 단축)
+            max_reports = 3 if TEST_MODE_RECENT_DAYS else 5
+            for r in reports[:max_reports]:
                 title, company, category, pdf_url = r["title"], r["company"], r["category"], r.get("pdf_url")
                 text = ""
                 if pdf_url:
@@ -159,8 +269,7 @@ class ReportSummarizerTool(BaseTool):
                     resp = client.chat.completions.create(
                         model=LLM_MODEL,
                         messages=[{"role": "system", "content": "사실 기반 요약만 수행."},
-                                  {"role": "user", "content": prompt}],
-                        temperature=0.0)
+                                  {"role": "user", "content": prompt}])
                     summary = resp.choices[0].message.content.strip()
                 except Exception as e:
                     summary = f"[요약 실패: {e}]"
@@ -205,8 +314,7 @@ class FinalBriefingTool(BaseTool):
             resp = client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=[{"role": "system", "content": "20년차 리서치 애널리스트로 사실 기반 브리핑 작성"},
-                          {"role": "user", "content": prompt}],
-                temperature=0.0)
+                          {"role": "user", "content": prompt}])
             body = resp.choices[0].message.content.strip()
             header = f"# {today_file} 일일 증권사 리포트 브리핑\n\n*총 {len(summaries)}건 기반 / {today_display} 발행*\n\n"
             return header + body
@@ -264,6 +372,13 @@ def run_daily_briefing():
     hankyung_reports = eval(hankyung_tool._run())
     all_reports = naver_reports + hankyung_reports
     print(f"   [OK] 총 {len(all_reports)}개 리포트 수집 완료")
+    print(f"   (네이버: {len(naver_reports)}개, 한경: {len(hankyung_reports)}개)")
+    
+    # 테스트 모드: 수집된 리포트 샘플 출력
+    if TEST_MODE_RECENT_DAYS and len(all_reports) > 0:
+        print(f"\n   [DEBUG] 수집 샘플:")
+        for i, r in enumerate(all_reports[:3], 1):
+            print(f"   {i}. [{r['date']}] {r['title'][:30]}... ({r['company']})")
     
     # 리포트가 없으면 조기 종료
     if len(all_reports) == 0:
@@ -295,7 +410,12 @@ def run_daily_briefing():
     print("\n[5/5] Notion 업로드 중...")
     notion_tool = NotionUploadTool()
     result = notion_tool._run(briefing, str(analysis))
-    print(f"   {result}")
+    # Windows 인코딩 에러 방지 (이모지 제거)
+    try:
+        result_str = str(result).encode('ascii', 'ignore').decode('ascii')
+        print(f"   {result_str}")
+    except:
+        print("   [OK] Notion 업로드 완료 (결과 출력 생략)")
     
     print("\n[COMPLETE] 모든 작업 완료!")
     return briefing
@@ -305,7 +425,7 @@ if __name__ == "__main__":
     # 주말 자동 실행 방지 (토요일=5, 일요일=6)
     # ----------------------------------------------------------
     weekday = datetime.today().weekday()  # 월=0, 화=1, ..., 일=6
-    IS_TEST_MODE = True  # 테스트용으로 오늘만 강제 실행하려면 True
+    IS_TEST_MODE = False  # 테스트용으로 오늘만 강제 실행하려면 True
     
     if weekday >= 5 and not IS_TEST_MODE:
         print("="*60)
@@ -325,7 +445,13 @@ if __name__ == "__main__":
             print("\n" + "="*60)
             print("최종 브리핑 미리보기:")
             print("="*60)
-            print(result[:500] + "..." if len(result) > 500 else result)
+            # Windows 인코딩 에러 방지
+            try:
+                result_preview = result[:500] + "..." if len(result) > 500 else result
+                # ASCII로 변환 (이모지 및 특수문자 제거)
+                print(result_preview.encode('ascii', 'ignore').decode('ascii'))
+            except:
+                print(f"   [OK] 브리핑 생성 완료 ({len(result)}자) - Notion 확인 필요")
         except Exception as e:
             print(f"\n[ERROR] 실행 중 오류 발생: {e}")
             import traceback

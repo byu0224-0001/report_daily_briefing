@@ -26,6 +26,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+      
+      - name: Display Chrome version
+        run: |
+          chrome --version
+      
       - name: Run daily briefing
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
