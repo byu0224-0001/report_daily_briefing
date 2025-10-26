@@ -40,7 +40,7 @@ today_display = datetime.now().strftime("%Y.%m.%d")
 today_file = datetime.now().strftime("%Y-%m-%d")
 
 # 테스트 모드: 최근 3일치 리포트 수집 (주말 대응)
-TEST_MODE_RECENT_DAYS = True  # True: 최근 3일, False: 오늘만
+TEST_MODE_RECENT_DAYS = False  # True: 최근 3일, False: 오늘만 (프로덕션 모드)
 if TEST_MODE_RECENT_DAYS:
     # 4자리 연도와 2자리 연도 둘 다 생성
     target_dates_full = [(datetime.now() - timedelta(days=i)).strftime("%Y.%m.%d") for i in range(3)]
@@ -342,29 +342,97 @@ class ReportSummarizerTool(BaseTool):
             original_url = pdf_url
             pdf_url = pdf_url.split("?")[0].split("#")[0]
             
-            # PDF URL 보정 (`.p` → `.pdf` 자동 추가)
-            if pdf_url and not pdf_url.lower().endswith(".pdf"):
-                # URL이 잘린 경우 (.p로 끝나는 경우)
-                if pdf_url.endswith(".p"):
-                    pdf_url = pdf_url[:-1] + "df"  # .p → .pdf
-                elif pdf_url.endswith(".pd"):
-                    pdf_url = pdf_url[:-2] + "pdf"  # .pd → .pdf
-                # pstatic URL 패턴 특별 처리
-                elif "pstatic.net" in pdf_url:
-                    pdf_url = pdf_url + ".pdf"
+            # 공백 제거 먼저 (중요!)
+            pdf_url_stripped = pdf_url.strip()
+            
+            # PDF URL 보정 (`.p` → `.pdf` 자동 추가) - 개선 버전
+            if pdf_url_stripped and not pdf_url_stripped.lower().endswith(".pdf"):
+                # URL이 잘린 경우 (.p 또는 .pd로 끝나는 경우)
+                if pdf_url_stripped.endswith(".p"):
+                    pdf_url = pdf_url_stripped[:-1] + "pdf"  # .p → .pdf (버그 수정)
+                elif pdf_url_stripped.endswith(".pd"):
+                    pdf_url = pdf_url_stripped[:-2] + "pdf"  # .pd → .pdf
+                # pstatic URL 패턴 특별 처리 (점으로 끝나지 않는 경우만)
+                elif "pstatic.net" in pdf_url_stripped and not pdf_url_stripped.endswith("."):
+                    pdf_url = pdf_url_stripped + ".pdf"
+                # 숫자로 끝나는 URL에도 .pdf 자동 추가
+                elif re.search(r'/\d+$', pdf_url_stripped):
+                    pdf_url = pdf_url_stripped + ".pdf"
+                else:
+                    pdf_url = pdf_url_stripped
+            else:
+                pdf_url = pdf_url_stripped
             
             print(f"      [DEBUG PDF] 원본: {original_url[:80]} → 수정: {pdf_url[:80]}")
             
-            res = requests.get(pdf_url, headers=HEADERS, timeout=15, stream=True)
-            if res.status_code != 200:
-                print(f"      [DEBUG PDF] HTTP {res.status_code}")
+            # HTTP 요청 시도 (다중 fallback)
+            res = None
+            attempts = []
+            
+            # 1. 보정된 URL부터 시도
+            if pdf_url_stripped != pdf_url:
+                attempts.append(pdf_url)
+                print(f"      [DEBUG PDF] 보정 URL 추가: {pdf_url[:80]}")
+            
+            # 2. 원본 URL 시도
+            attempts.append(pdf_url_stripped)
+            
+            # 3. .p/.pd 패턴이면 수정본 추가 시도
+            if pdf_url_stripped.endswith(".p") and pdf_url_stripped not in attempts:
+                fixed_p = pdf_url_stripped[:-1] + "pdf"  # 버그 수정: df → pdf
+                attempts.append(fixed_p)
+                print(f"      [DEBUG PDF] .p 수정본 추가: {fixed_p[:80]}")
+            elif pdf_url_stripped.endswith(".pd") and pdf_url_stripped not in attempts:
+                fixed_pd = pdf_url_stripped[:-2] + "pdf"
+                attempts.append(fixed_pd)
+                print(f"      [DEBUG PDF] .pd 수정본 추가: {fixed_pd[:80]}")
+            
+            # 4. 확장자 없는 경우 .pdf 추가 시도
+            if not pdf_url_stripped.endswith(".pdf") and not pdf_url_stripped.endswith(".p") and not pdf_url_stripped.endswith(".pd"):
+                attempts.append(pdf_url_stripped + ".pdf")
+                print(f"      [DEBUG PDF] .pdf 추가 시도: {(pdf_url_stripped + '.pdf')[:80]}")
+            
+            for i, attempt_url in enumerate(attempts):
+                try:
+                    print(f"      [DEBUG PDF] 시도 {i+1}/{len(attempts)}: {attempt_url[:80]}")
+                    res = requests.get(attempt_url, headers=HEADERS, timeout=15, stream=True)
+                    if res.status_code == 200:
+                        pdf_url = attempt_url
+                        if len(attempts) > 1:
+                            print(f"      [DEBUG PDF] ✓ 성공! {attempt_url[:80]}")
+                        break
+                    else:
+                        print(f"      [DEBUG PDF] HTTP {res.status_code}")
+                except Exception as e:
+                    print(f"      [DEBUG PDF] 예외: {str(e)[:50]}")
+                    continue
+            
+            if not res or res.status_code != 200:
+                print(f"      [DEBUG PDF] HTTP {res.status_code if res else 'None'} - 모든 시도 실패")
                 return ""
             
             # Content-Type 검증 완화 (PDF가 아니어도 시도)
             content_type = res.headers.get('content-type', '').lower()
             if 'pdf' not in content_type and not pdf_url.endswith('.pdf'):
                 print(f"      [DEBUG PDF] Content-Type: {content_type} (PDF 아님)")
-                # PDF가 아니어도 시도 (일부 서버가 잘못된 content-type 전송)
+                
+                # HTML 응답인 경우 재시도
+                if content_type.startswith('text/html'):
+                    print(f"      [DEBUG PDF] HTML 응답 → URL 재구성 시도")
+                    # .pdf 자동 추가 시도
+                    alt_pdf = pdf_url.split("?")[0] + ".pdf"
+                    try:
+                        res_alt = requests.get(alt_pdf, headers=HEADERS, timeout=10)
+                        if res_alt.status_code == 200 and 'pdf' in res_alt.headers.get('content-type', '').lower():
+                            res = res_alt
+                            pdf_url = alt_pdf
+                            print(f"      [DEBUG PDF] 재구성 성공: {alt_pdf[:80]}")
+                        else:
+                            print(f"      [DEBUG PDF] HTML 재시도 실패 → PDF 아님")
+                            return ""
+                    except Exception as e:
+                        print(f"      [DEBUG PDF] HTML 재시도 예외: {str(e)[:50]}")
+                        return ""
             
             # 파일명을 고유하게 생성 (동시 접근 방지)
             import uuid
@@ -631,6 +699,8 @@ class FinalBriefingTool(BaseTool):
         
         prompt = f"""위 리포트들을 카테고리별로 분석하여 투자자용 일일 브리핑을 작성하라.
 
+**중요: 모든 리포트의 핵심 내용을 빠짐없이 포함해야 함. 하나의 리포트라도 놓치면 안 됨.**
+
 {''.join(category_summaries)}
 
 [키워드 분석]
@@ -640,10 +710,15 @@ class FinalBriefingTool(BaseTool):
 **응답 형식:**
 
 ## 1. 카테고리별 요약
-1) 투자정보 리포트 요약
-2) 종목분석 리포트 요약
-3) 산업분석 리포트 요약
-4) 경제분석 리포트 요약
+**각 리포트별로 명시:**
+- 어떤 기업/산업을 다루는가
+- 리포트의 핵심 평가/전망은 무엇인가
+- 투자 의견은 무엇인가 (목표가 상향/하향, 매수/중립/매도)
+
+1) 투자정보 리포트 요약 (모든 리포트 포함)
+2) 종목분석 리포트 요약 (모든 리포트 포함)
+3) 산업분석 리포트 요약 (모든 리포트 포함)
+4) 경제분석 리포트 요약 (모든 리포트 포함)
 
 ## 2. 핵심 테마 (5~8개 종목/산업)
 구체적 내용 반영
@@ -657,6 +732,7 @@ class FinalBriefingTool(BaseTool):
 **절대 금지:**
 - "원하시면", "추가로 제공" 같은 질문
 - 마무리 문구
+- 리포트 일부만 언급하고 생략하는 것
 위 형식만 작성"""
         
         try:
@@ -773,7 +849,7 @@ if __name__ == "__main__":
         print(f"[SKIP] 주말 스킵 ({today_display})")
     else:
         if IS_TEST_MODE and weekday >= 5:
-            print(f"\n[TEST MODE] 주말이지만 테스트 모드로 실행합니다.\n오늘: {today_display} (일요일)")
+            print(f"\n[TEST MODE] 주말이지만 테스트 모드로 실행합니다.\n오늘: {today_display}")
         
         result = run_daily_briefing()
         
