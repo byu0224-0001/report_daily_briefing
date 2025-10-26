@@ -42,7 +42,7 @@ GitHub Actions가 작동하려면 **4개의 Secret**을 설정해야 합니다.
 | Secret Name             | 값 예시                                | 설명                      |
 |-------------------------|----------------------------------------|---------------------------|
 | `OPENAI_API_KEY`        | `sk-proj-xxxxxxxxxxxxxxxx`             | OpenAI API 키             |
-| `OPENAI_MODEL_NAME`     | `gpt-4o`                               | 사용할 모델 이름          |
+| `OPENAI_MODEL_NAME`     | `gpt-5-mini`                           | 사용할 모델 이름          |
 | `NOTION_API_KEY`        | `secret_xxxxxxxxxxxxxxxx`              | Notion Integration 토큰   |
 | `NOTION_DATABASE_ID`    | `xxxxxxxxxxxxxxxx`                     | Notion Database ID        |
 
@@ -157,5 +157,6 @@ run_daily_briefing.py 실행
 
 **다음 URL에서 Secrets를 설정하세요:**
 👉 https://github.com/byu0224-0001/report_daily_briefing/settings/secrets/actions
+
 
 
