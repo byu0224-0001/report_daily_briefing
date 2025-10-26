@@ -224,6 +224,7 @@ class PythonAnalyzerTool(BaseTool):
             stop = {"리포트", "분석", "전망", "투자", "경제", "산업", "이슈"}
             counter = Counter([w for w in words if w not in stop])
             result = {
+                "total_reports": len(df),  # 총 리포트 수 추가
                 "top_keywords": ", ".join([f"{k}({v}회)" for k, v in counter.most_common(7)]),
                 "category_summary": df["category"].value_counts().to_dict()
             }
@@ -332,13 +333,22 @@ class NotionUploadTool(BaseTool):
         """Notion에 업로드"""
         try:
             analysis = eval(analysis_str)
+            
+            # 작성일시 (현재 시간)
+            now_str = datetime.now().isoformat()
+            
+            # 리포트 수 계산
+            total_reports = analysis.get("total_reports", 0)
+            
             page_data = {
                 "parent": {"database_id": NOTION_DATABASE_ID},
                 "properties": {
+                    "Name": {"title": [{"text": {"content": f"{today_file} 일일 브리핑"}}]},
                     "Date": {"date": {"start": today_file}},
+                    "작성일시": {"date": {"start": now_str}},
+                    "총 리포트 수": {"number": total_reports},
                     "Top Keywords": {"rich_text": [{"text": {"content": analysis.get("top_keywords", "")[:2000]}}]},
                     "Category Summary": {"rich_text": [{"text": {"content": str(analysis.get("category_summary", {}))[:2000]}}]},
-                    "Name": {"title": [{"text": {"content": f"{today_file} 일일 브리핑"}}]}
                 }
             }
             res = requests.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=page_data)
