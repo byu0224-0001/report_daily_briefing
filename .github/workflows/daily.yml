@@ -2,9 +2,9 @@ name: Daily AI Briefing
 
 on:
   schedule:
-    # Runs Monday-Friday at 07:00 AM KST (22:00 UTC previous day)
+    # Runs Monday-Friday at 09:00 AM KST (00:00 UTC same day)
     # Cron: minute hour day month weekday (0=Sun, 1=Mon, ..., 6=Sat)
-    - cron: '0 22 * * 1-5'
+    - cron: '0 0 * * 1-5'
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
