@@ -1,4 +1,4 @@
-# 🤖 AI Daily Briefing System (v11.1)
+# 🤖 AI Daily Briefing System (v7-Final)
 
 **CrewAI 기반 일일 증권사 리포트 자동 수집·분석·브리핑 시스템**
 
@@ -16,7 +16,7 @@
 3. **PDF 본문 요약** (GPT-5-mini 기반 2-3줄 요약)
 4. **일일 브리핑 생성** (애널리스트 스타일 종합 리포트)
 5. **Notion 자동 업로드** (페이지 + 본문 블록 생성)
-6. **GitHub Actions 자동 실행** (매일 오전 9시 KST, 평일만)
+6. **GitHub Actions 자동 실행** (매일 오전 7시 KST)
 
 ---
 
@@ -136,8 +136,7 @@ python run_daily_briefing.py
 | `NOTION_DATABASE_ID` | `xxxxxxxxxxxxxxxx`                  |
 
 #### 3-2. 자동 실행 확인
-- **평일 오전 9시 (KST)** 자동 실행 (월~금)
-- 주말은 자동 스킵
+- **매일 오전 7시 (KST)** 자동 실행
 - **Actions** 탭에서 실행 로그 확인 가능
 - 수동 실행: **Actions** → **Daily AI Briefing** → **Run workflow**
 
@@ -255,21 +254,5 @@ python run_daily_briefing.py --test  # 3개 리포트만 수집
 
 ---
 
-**🎉 이제 매일 평일 오전 9시, 자동으로 생성되는 브리핑을 Notion에서 확인하세요!**
-
----
-
-## 📌 v11.1 주요 변경사항
-
-### ✅ 프로덕션 모드 활성화
-- 테스트 모드 해제, 평일만 실행
-- PDF whitelist 검증 강화 (stock.pstatic.net만 허용)
-- HTML fallback 로직 개선 (신한투자 리포트 대응)
-- 인코딩 안정화 (PYTHONUTF8=1 추가)
-
-### 🛠️ 기술 개선
-- PDF URL 필터링 강화 (종목 페이지 차단)
-- meta refresh 리다이렉트 추적 (무한 루프 방지)
-- Mobile UA 조건부 적용
-- PDF 캐싱 구조 추가
+**🎉 이제 매일 아침 7시, 자동으로 생성되는 브리핑을 Notion에서 확인하세요!**
 
