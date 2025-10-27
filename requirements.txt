@@ -8,4 +8,5 @@ crewai>=0.28.0
 crewai-tools>=0.1.6
 selenium>=4.15.0
 webdriver-manager>=4.0.0
+charset_normalizer>=3.3.0  # v11.1: 인코딩 개선
 

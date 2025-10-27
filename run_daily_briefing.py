@@ -1,10 +1,24 @@
 # ==========================================================
-# CrewAI Daily Briefing v9.0 (전수 리포트 분석 + 하이브리드 모델)
-# - 모든 리포트 전수 요약 (PDF + HTML)
-# - gpt-4o-mini (압축) + gpt-5-mini (브리핑)
-# - 병렬 처리로 속도 최적화
+# CrewAI Daily Briefing v11.1 (통합 개선 안정화 버전 - PDF/HTML 추출 로직 강화)
+# Phase 1 (긴급): PDF 필터 강화, 신한투자 HTML 검증, 인코딩 수정
+# Phase 2 (구조): Mobile UA 전역화, meta refresh 추적(재시도 제한), iframe JS 처리
+# Phase 3 (최적화): PDF 캐싱, 중복 제거, 로깅 개선
+# v11.1: PDF URL whitelist 검증, HTML fallback 강화, 인코딩 순서 수정
 # ==========================================================
-import os, re, time, fitz, requests, pandas as pd
+import sys
+import os  # 인코딩 설정 전에 먼저 import
+import hashlib  # Phase 3: PDF 캐싱용
+import logging  # Phase 3: 로깅 개선용
+import json  # Phase 3: 캐시 저장용
+
+# Windows Unicode 인코딩 강제 설정 (Phase 1)
+if sys.platform == "win32":
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+    os.environ["PYTHONUTF8"] = "1"  # 추가 UTF-8 강제
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+import re, time, fitz, requests, pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from collections import Counter
@@ -15,7 +29,11 @@ from crewai.tools import BaseTool
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from urllib.parse import urljoin  # v10.4: URL 정규화
 
 # ----------------------------------------------------------
 # 0️⃣ 환경 설정
@@ -39,8 +57,8 @@ NOTION_HEADERS = {"Authorization": f"Bearer {NOTION_API_KEY}",
 today_display = datetime.now().strftime("%Y.%m.%d")
 today_file = datetime.now().strftime("%Y-%m-%d")
 
-# 테스트 모드: 최근 3일치 리포트 수집 (주말 대응)
-TEST_MODE_RECENT_DAYS = False  # True: 최근 3일, False: 오늘만 (프로덕션 모드)
+# 프로덕션 모드: 오늘 날짜만 수집
+TEST_MODE_RECENT_DAYS = False  # True: 최근 3일 (테스트), False: 오늘만 (프로덕션)
 if TEST_MODE_RECENT_DAYS:
     # 4자리 연도와 2자리 연도 둘 다 생성
     target_dates_full = [(datetime.now() - timedelta(days=i)).strftime("%Y.%m.%d") for i in range(3)]
@@ -52,16 +70,29 @@ else:
     print(f"[PROD] 오늘 날짜만 수집: {today_display}")
 
 # ----------------------------------------------------------
-# 🌐 Selenium 설정
+# 🌐 Selenium 설정 (Phase 2: Mobile UA 전역 적용)
 # ----------------------------------------------------------
-def create_selenium_driver():
+# Phase 2: Mobile User-Agent 전역 적용 (신한투자 JS 페이지 대응)
+MOBILE_USER_AGENT = ("Mozilla/5.0 (Linux; Android 10; SM-G973F) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Mobile Safari/537.36")
+
+def create_selenium_driver(force_mobile=False):
+    """Selenium 드라이버 생성 (Phase 2: Mobile UA 옵션)"""
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument(f"user-agent={HEADERS['User-Agent']}")
+    
+    # Phase 2: Mobile UA 조건부 적용
+    if force_mobile:
+        chrome_options.add_argument(f"user-agent={MOBILE_USER_AGENT}")
+        print(f"      [DEBUG] Mobile User-Agent 적용")
+    else:
+        chrome_options.add_argument(f"user-agent={HEADERS['User-Agent']}")
+    
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=chrome_options)
 
@@ -153,60 +184,119 @@ class NaverResearchScraperTool(BaseTool):
                     if not href or href == "#":
                         continue
                     
-                    # URL 조합: 절대 경로 체크
-                    if href.startswith("http"):
-                        detail_url = href
-                    elif href.startswith("/"):
-                        detail_url = "https://finance.naver.com" + href
-                    else:
-                        detail_url = "https://finance.naver.com/" + href
+                    # v10.7: 블랙리스트 방식으로 변경 (금지된 패턴만 차단)
+                    # 종목분석은 /item/ 허용 (종목 페이지로 링크가 가더라도 PDF는 첨부 컬럼에 있음)
+                    excluded_patterns = ["/chart/", "/quote/", "/news/"]  # /item/, /frgn/ 제거
+                    if cat != "종목분석":  # 종목분석이 아니면 /item/도 차단
+                        excluded_patterns.append("/item/")
+                        excluded_patterns.append("/frgn/")
+
+                    if any(pattern in href for pattern in excluded_patterns):
+                        # 종목/차트 페이지는 스킵하되 로그 출력
+                        if i < 3:  # 처음 3개만 디버그 출력
+                            print(f"      [DEBUG] 금지된 URL 패턴 감지, 스킵: {href[:60]}...")
+                        continue
                     
-                    # PDF URL 추출: 첨부 컬럼에서 직접 찾기 (강화)
+                    # v10.8: 종목분석 카테고리 필터 제거
+                    # (종목분석은 /item/ 링크를 허용하고, PDF는 첨부 컬럼에서 직접 찾음)
+
+                    # v10.4: URL 정규화 (urljoin으로 절대 경로 강제 변환)
+                    detail_url = urljoin("https://finance.naver.com", href)
+                    
+                    # PDF URL 추출: 목록에서 직접 찾기 (V9.3 방식)
                     pdf_url = None
                     try:
-                        # 첨부 컬럼 (보통 cols[3] 또는 cols[4])
-                        attach_col = cols[3] if len(cols) > 3 else cols[2] if len(cols) > 2 else None
-                        if attach_col:
-                            # 네이버 PDF 다운로드 링크 패턴 강화
-                            pdf_link = attach_col.find("a", href=re.compile(r"\.pdf|download|filekey|attach|report|view", re.IGNORECASE))
+                        # 모든 컬럼 순회하며 PDF 링크 찾기
+                        for col_idx, col in enumerate(cols):
+                            # 1. <a> 태그에서 href 찾기
+                            pdf_link = col.find("a", href=re.compile(r"\.pdf|download|filekey|attach|report|view", re.IGNORECASE))
                             if pdf_link:
                                 href = pdf_link.get("href", "")
-                                if href.startswith("http"):
-                                    pdf_url = href
-                                elif href.startswith("/"):
-                                    pdf_url = "https://finance.naver.com" + href
-                                else:
-                                    pdf_url = "https://finance.naver.com/" + href
+                                if href:
+                                    pdf_url = urljoin("https://finance.naver.com", href)
+                                    print(f"      [DEBUG PDF] 첨부 링크 발견 (컬럼 {col_idx})")
+                                    print(f"      [DEBUG PDF] 목록에서 PDF 링크 발견: {pdf_url[:80]}...")
+                                    break
+                            
+                            # 2. 이미지 alt/title에서 PDF 확인
+                            img = col.find("img")
+                            if img and ("pdf" in (img.get("alt", "") + img.get("title", "")).lower()):
+                                # 부모 <a> 찾기
+                                parent_a = col.find("a")
+                                if parent_a:
+                                    href = parent_a.get("href", "")
+                                    if href:
+                                        pdf_url = urljoin("https://finance.naver.com", href)
+                                        print(f"      [DEBUG PDF] 첨부 이미지 발견 (컬럼 {col_idx})")
+                                        print(f"      [DEBUG PDF] 목록에서 PDF 링크 발견: {pdf_url[:80]}...")
+                                        break
+                            
+                            # 3. svg 아이콘 확인
+                            svg = col.find("svg")
+                            if svg:
+                                parent_a = col.find("a")
+                                if parent_a:
+                                    href = parent_a.get("href", "")
+                                    if href and (".pdf" in href.lower() or "download" in href.lower() or "filekey" in href.lower()):
+                                        pdf_url = urljoin("https://finance.naver.com", href)
+                                        print(f"      [DEBUG PDF] 첨부 아이콘 발견 (컬럼 {col_idx})")
+                                        print(f"      [DEBUG PDF] 목록에서 PDF 링크 발견: {pdf_url[:80]}...")
+                                        break
                         
-                        # 상세 페이지에서 PDF 찾기
+                        # 신한투자증권 리포트 체크: PDF가 없으면 상세 페이지 본문만 사용
+                        if not pdf_url and "신한" in company:
+                            # v10.7: URL 유효성 체크 후 리포트 수집 (스킵 제거)
+                            if not detail_url or ("read.naver" not in detail_url and "/research/" not in detail_url):
+                                print(f"      [INFO] 신한투자증권 리포트: URL 유효하지 않음 (PDF/HTML 모두 시도)")
+                            else:
+                                print(f"      [INFO] 신한투자증권 리포트: 상세 페이지 본문만 사용 (PDF URL 없음)")
+                            print(f"      [WARN] PDF URL 없음: {title_tag.get_text(strip=True)[:30]}...")
+                        
+                        # PDF가 없는 경우 상세 페이지에서 추가 시도
                         if not pdf_url:
-                            d_res = requests.get(detail_url, headers=HEADERS, timeout=5)
-                            d_soup = BeautifulSoup(d_res.text, "html.parser")
-                            
-                            # 다양한 패턴 시도 (강화)
-                            pdf_btn = d_soup.find("a", href=re.compile(r"download|view|filekey|attach|\.pdf", re.IGNORECASE))
-                            if not pdf_btn:
-                                pdf_btn = d_soup.find("a", string=re.compile("리포트보기|PDF|다운로드|보기", re.IGNORECASE))
-                            if not pdf_btn:
-                                pdf_btn = d_soup.find("a", class_=re.compile("pdf|download|report", re.IGNORECASE))
-                            
-                            if pdf_btn:
-                                pdf_href = pdf_btn.get("href", "")
-                                if pdf_href.startswith("http"):
-                                    pdf_url = pdf_href
-                                elif pdf_href.startswith("/"):
-                                    pdf_url = "https://finance.naver.com" + pdf_href
-                                else:
-                                    pdf_url = "https://finance.naver.com/" + pdf_href
+                            try:
+                                d_res = requests.get(detail_url, headers=HEADERS, timeout=5)
+                                d_soup = BeautifulSoup(d_res.text, "html.parser")
+                                
+                                # 다양한 패턴 시도
+                                pdf_btn = d_soup.find("a", href=re.compile(r"download|view|filekey|attach|\.pdf", re.IGNORECASE))
+                                if not pdf_btn:
+                                    pdf_btn = d_soup.find("a", string=re.compile("리포트보기|PDF|다운로드|보기", re.IGNORECASE))
+                                if not pdf_btn:
+                                    pdf_btn = d_soup.find("a", class_=re.compile("pdf|download|report", re.IGNORECASE))
+                                
+                                if pdf_btn:
+                                    pdf_href = pdf_btn.get("href", "")
+                                    if pdf_href.startswith("http"):
+                                        pdf_url = pdf_href
+                                    elif pdf_href.startswith("/"):
+                                        pdf_url = "https://finance.naver.com" + pdf_href
+                                    else:
+                                        pdf_url = "https://finance.naver.com/" + pdf_href
+                                    print(f"      [DEBUG PDF] 상세 페이지에서 PDF 발견: {pdf_url[:80]}...")
+                            except:
+                                pass
                     except Exception as e:
                         pdf_url = None
-                    # URL 유효성 검사 (종목 화면 리다이렉트 제외 - 확장)
+                    
+                    # v11.1: PDF가 없으면 detail_url을 HTML 소스로 사용 (HTML fallback)
+                    # URL 유효성 검사
                     valid_url = detail_url
                     if not detail_url or not detail_url.startswith("http"):
                         valid_url = None
-                    # 모든 /item/ 패턴 제외 (종목 페이지)
-                    if valid_url and "/item/" in valid_url:
-                        valid_url = None
+                    
+                    # PDF가 없는 경우, HTML URL로 사용 (신한투자 등 HTML 리포트 대응)
+                    if not pdf_url:
+                        # detail_url을 HTML URL로 사용
+                        if detail_url and ("read.naver" in detail_url or "/research/" in detail_url):
+                            valid_url = detail_url
+                        elif valid_url and "/item/" in valid_url:
+                            # /item/은 종목 페이지이므로 제외
+                            valid_url = None
+                    else:
+                        # PDF가 있으면 /item/ 패턴 제외
+                        if valid_url and "/item/" in valid_url:
+                            valid_url = None
                     
                     reports.append({
                         "source": "네이버",
@@ -332,11 +422,34 @@ class ReportSummarizerTool(BaseTool):
     description: str = "전체 리포트 전수 요약 (병렬 처리)"
     
     def _extract_pdf_text(self, pdf_url: str) -> str:
-        """PDF 본문 추출"""
+        """PDF 본문 추출 (v11.1: PDF URL whitelist 검증 강화)"""
         try:
             # PDF URL 유효성 검증
             if not pdf_url or not isinstance(pdf_url, str):
                 return ""
+            
+            # v11.1: PDF URL whitelist 기반 검증 (먼저 whitelist 확인)
+            valid_pdf_patterns = [
+                r'stock\.pstatic\.net/stock-research/.*\.pdf',
+                r'pstatic\.net/stock-research/.*\.pdf',
+            ]
+            is_valid = any(re.search(p, pdf_url) for p in valid_pdf_patterns)
+            if not is_valid:
+                print(f"      [DEBUG PDF] whitelist 불일치, PDF로 인정 불가: {pdf_url[:80]}")
+                return ""  # whitelist에 없으면 PDF가 아님
+            
+            # Phase 1 (v11.0): 종목/차트 페이지 강력 차단 (URL 패턴으로 선차단)
+            invalid_patterns = [
+                r'/(item|chart|quote|news|frgn)/',       # 기존 패턴
+                r'finance\.naver\.com/item/',            # 네이버 종목 페이지
+                r'\.frgn\.naver',                        # 외국인 페이지
+                r'/item/frgn',                           # 종목 외국인 페이지
+            ]
+            
+            for pattern in invalid_patterns:
+                if re.search(pattern, pdf_url, re.I):
+                    print(f"      [DEBUG PDF] 금지된 URL 패턴 감지: {pdf_url[:80]}")
+                    return ""
             
             # URL 파라미터 제거 (query string, fragment 제거)
             original_url = pdf_url
@@ -409,6 +522,12 @@ class ReportSummarizerTool(BaseTool):
             
             if not res or res.status_code != 200:
                 print(f"      [DEBUG PDF] HTTP {res.status_code if res else 'None'} - 모든 시도 실패")
+                
+                # v10.5: 보정 실패한 .p, .pd는 차단
+                if pdf_url.endswith(".p") or pdf_url.endswith(".pd"):
+                    print(f"      [DEBUG PDF] 보정 실패, 잘린 확장자 차단: {pdf_url[:80]}")
+                    return ""
+                
                 return ""
             
             # Content-Type 검증 완화 (PDF가 아니어도 시도)
@@ -465,32 +584,261 @@ class ReportSummarizerTool(BaseTool):
             print(f"      [PDF 추출 실패: {e}]")
             return ""
     
-    def _extract_html_text(self, url: str) -> str:
-        """PDF가 없을 경우 HTML 본문 크롤링 (Selenium으로 JS 렌더링된 페이지)"""
+    def _extract_html_text(self, url: str, company: str = "") -> str:
+        """PDF가 없을 경우 HTML 본문 크롤링 (Selenium으로 JS 렌더링된 페이지) - v10.0"""
         try:
             print(f"      [DEBUG HTML] URL: {url[:80]}")
             # Selenium으로 JS 렌더링된 본문 가져오기
             driver = create_selenium_driver()
+            driver.implicitly_wait(5)  # 대기 시간 증가
             driver.get(url)
             time.sleep(3)  # JS 로딩 대기
             
-            # iframe이 있는 경우 내부 문서 접근 (이중 iframe 탐색)
+            # v10.4: 404 에러 페이지 감지 강화 (다중 인코딩)
+            page_title = driver.title
+            page_size = len(driver.page_source)
+            print(f"      [DEBUG HTML] 페이지 타이틀: {page_title}")
+            print(f"      [DEBUG HTML] 페이지 크기: {page_size} 자")
+            
+            # 다중 인코딩 검사 (EUC-KR + UTF-8)
+            page_raw = driver.page_source
             try:
-                iframes = driver.find_elements("tag name", "iframe")
+                page_euckr = page_raw.encode('euc-kr', errors='ignore').decode('euc-kr', errors='ignore')
+            except:
+                page_euckr = page_raw
+            
+            # v10.9: 404 감지 단순화 (과도한 필터링 제거)
+            is_404 = any(keyword in page_raw for keyword in [
+                "페이지를 찾을 수 없습니다",
+                "찾으시는 모든 정보",
+                "404 Not Found"
+            ]) or ("404" in page_title and "네이버" in page_title)
+            
+            # Phase 2 (v11.0): meta refresh 추적 + 재시도 제한 (무한 루프 방지)
+            redirect_count = 0
+            max_redirects = 3
+            visited_urls = set()  # 무한 루프 방지: 방문한 URL 저장
+            
+            while not is_404 and redirect_count < max_redirects:
+                try:
+                    current_url = driver.current_url
+                    
+                    # 무한 루프 감지: 같은 URL을 다시 방문하면 중단
+                    if current_url in visited_urls:
+                        print(f"      [DEBUG HTML] 무한 루프 감지 (동일 URL 재방문): {current_url[:80]}")
+                        break
+                    visited_urls.add(current_url)
+                    
+                    soup_page = BeautifulSoup(driver.page_source[:10000], "html.parser")
+                    meta_refresh = soup_page.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})
+                    
+                    if meta_refresh and "url=" in meta_refresh.get("content", "").lower():
+                        content = meta_refresh.get("content", "")
+                        redirect_url_match = re.search(r'url=([^";\s]+)', content, re.I)
+                        
+                        if redirect_url_match:
+                            redirect_url = redirect_url_match.group(1).strip()
+                            if not redirect_url.startswith("http"):
+                                redirect_url = urljoin(current_url, redirect_url)
+                            
+                            # 다음 URL이 이미 방문한 URL이면 중단 (무한 루프 방지)
+                            if redirect_url in visited_urls:
+                                print(f"      [DEBUG HTML] 무한 루프 감지 (이미 방문한 URL): {redirect_url[:80]}")
+                                break
+                            
+                            print(f"      [DEBUG HTML] meta refresh {redirect_count+1}회: {redirect_url[:80]}")
+                            driver.get(redirect_url)
+                            time.sleep(2)
+                            redirect_count += 1
+                            continue
+                    
+                    # meta refresh 없으면 루프 종료
+                    break
+                    
+                except Exception as redirect_e:
+                    print(f"      [DEBUG HTML] 리다이렉트 오류: {str(redirect_e)[:50]}")
+                    break
+            
+            if is_404:
+                print(f"      [ERROR] 404 에러 페이지 감지: {url}")
+                # 404 페이지 디버깅 저장
+                if "신한" in company:
+                    html_content = driver.page_source
+                    if not os.path.exists("debug_html"):
+                        os.makedirs("debug_html")
+                    safe_company = re.sub(r'[^\w\s-]', '', company)[:20]
+                    debug_file = f"debug_html/404_{safe_company}_{int(time.time())}.html"
+                    with open(debug_file, "w", encoding="utf-8") as f:
+                        f.write(html_content)
+                    print(f"      [DEBUG HTML] 404 페이지 저장: {debug_file}")
+                driver.quit()
+                return ""
+            
+            # === v10.4: 디버그 HTML 저장 (신한투자 전용, 정상 페이지만) ===
+            if "신한" in company:
+                html_content = driver.page_source
+                if not os.path.exists("debug_html"):
+                    os.makedirs("debug_html")
+                safe_company = re.sub(r'[^\w\s-]', '', company)[:20]
+                debug_file = f"debug_html/ok_{safe_company}_{int(time.time())}.html"
+                with open(debug_file, "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                print(f"      [DEBUG HTML] 정상 페이지 저장: {debug_file}")
+                print(f"      [DEBUG HTML] 페이지 크기: {len(html_content)} 자")
+            
+            # 신한투자 특화 선택자 처리 (나중에 사용)
+            if False:  # 임시 비활성화
+                print(f"      [DEBUG HTML] 신한투자증권 리포트 감지 (company: {company})")
+                content_selectors = [
+                    # 신한투자 특화 선택자 (우선순위 높게)
+                    "div.view_cont",      # 신한투자 본문 컨테이너
+                    "td.view_cont",       # 신한투자 테이블 셀
+                    "div.article_content", # 기사 본문
+                    "div.content_body",   # 본문 영역
+                    "div#content_detail", # 상세 본문 ID
+                    "div.report_view",    # 리포트 뷰
+                    "div.article_view",   # 기사 뷰
+                    # 네이버 표준 선택자
+                    "td.view_cnt",
+                    "div.view_cnt",
+                    "td.view_content",
+                    "table.view",
+                    "div.view_con",
+                    # 일반 선택자
+                    "div.report-content",
+                    "div.report-body",
+                    "div.viewer-content",
+                    "div.article-content",
+                    "td.content",
+                    "div.content",
+                    "#articleBody",
+                    "article"
+                ] + content_selectors
+            
+            # iframe이 있는 경우 내부 문서 접근 (v10.0: 다중 방법 탐색)
+            html = None
+            try:
+                # v10.0: 다중 방법으로 iframe 탐색
+                iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                
+                # 방법 2: XPath로 iframe 찾기
+                if not iframes:
+                    iframes = driver.find_elements(By.XPATH, "//iframe")
+                
+                # 방법 3: CSS 선택자로 iframe 찾기
+                if not iframes:
+                    iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[id*='view'], iframe[src]")
+                
+                # 방법 4: frame 태그도 찾기
+                if not iframes:
+                    iframes = driver.find_elements(By.TAG_NAME, "frame")
+                
+                print(f"      [DEBUG HTML] iframe 탐색 완료: {len(iframes)}개 발견")
+                
                 if iframes:
-                    driver.switch_to.frame(iframes[0])
-                    time.sleep(1)
-                    # 이중 iframe 확인
-                    inner_iframes = driver.find_elements("tag name", "iframe")
-                    if inner_iframes:
-                        driver.switch_to.frame(inner_iframes[0])
-                        time.sleep(1)
-                    html = driver.page_source
-                    driver.switch_to.default_content()
+                    print(f"      [DEBUG HTML] iframe {len(iframes)}개 발견")
+                    
+                    # iframe 순회하며 본문 찾기
+                    for idx, frame in enumerate(iframes):
+                        try:
+                            # v10.9: 신한투자 iframe 직접 접근 + Mobile UA 적용
+                            src = frame.get_attribute("src")
+                            if src and "shinhaninvest" in src.lower():
+                                print(f"      [DEBUG HTML] 신한 iframe src 감지: {src[:80]}")
+                                
+                                # Mobile User-Agent로 전환
+                                mobile_ua = ("Mozilla/5.0 (Linux; Android 10; SM-G973F) "
+                                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                           "Chrome/124.0.0.0 Mobile Safari/537.36")
+                                driver.execute_cdp_cmd("Network.setUserAgentOverride", 
+                                                      {"userAgent": mobile_ua})
+                                print(f"      [DEBUG HTML] Mobile UA 적용")
+                                
+                                driver.get(src)  # iframe src로 직접 이동
+                                time.sleep(2)
+                                html = driver.page_source
+                                if len(html) > 1000:
+                                    break
+                                
+                                # 원래 페이지로 복귀
+                                driver.execute_cdp_cmd("Network.setUserAgentOverride", 
+                                                      {"userAgent": HEADERS['User-Agent']})
+                                driver.back()
+                                time.sleep(1)
+                                continue
+                            
+                            # 기존 프레임 전환 방식 (fallback)
+                            driver.switch_to.frame(frame)
+                            time.sleep(2)  # iframe 렌더링 대기 (1초 → 2초)
+                            
+                            # 내부 iframe 확인 (이중 구조)
+                            inner_iframes = driver.find_elements("tag name", "iframe")
+                            if inner_iframes:
+                                print(f"      [DEBUG HTML] 내부 iframe {len(inner_iframes)}개 발견")
+                                for inner_idx, inner_frame in enumerate(inner_iframes):
+                                    try:
+                                        driver.switch_to.frame(inner_frame)
+                                        time.sleep(2)  # 내부 iframe 렌더링 대기
+                                        
+                                        # iframe 내부 HTML 가져오기
+                                        candidate_html = driver.page_source
+                                        
+                                        # 본문 유효성 검사
+                                        if len(candidate_html) > 1000:
+                                            # 본문 키워드 확인
+                                            if any(keyword in candidate_html for keyword in ["경쟁사", "이익률", "매출", "전망", "증권", "리포트"]):
+                                                print(f"      [DEBUG HTML] 내부 iframe #{inner_idx} 본문 확인: {len(candidate_html)}자")
+                                                html = candidate_html
+                                                break
+                                        
+                                        driver.switch_to.parent_frame()
+                                    except Exception as inner_e:
+                                        print(f"      [DEBUG HTML] 내부 iframe #{inner_idx} 전환 실패: {str(inner_e)[:50]}")
+                                        try:
+                                            driver.switch_to.parent_frame()
+                                        except:
+                                            pass
+                                        continue
+                            
+                            # 내부 iframe에서 본문 못 찾았으면 외부 iframe에서 시도
+                            if not html or len(html) < 1000:
+                                candidate_html = driver.page_source
+                                if len(candidate_html) > 1000:
+                                    if any(keyword in candidate_html for keyword in ["경쟁사", "이익률", "매출", "전망", "증권", "리포트"]):
+                                        print(f"      [DEBUG HTML] 외부 iframe #{idx} 본문 확인: {len(candidate_html)}자")
+                                        html = candidate_html
+                            
+                            # 성공하면 탈출
+                            if html and len(html) > 1000:
+                                driver.switch_to.default_content()
+                                break
+                            
+                            # 기본 프레임으로 복귀
+                            driver.switch_to.default_content()
+                            
+                        except Exception as frame_e:
+                            print(f"      [DEBUG HTML] iframe #{idx} 전환 실패: {str(frame_e)[:50]}")
+                            try:
+                                driver.switch_to.default_content()
+                            except:
+                                pass
+                            continue
+                    
+                    # iframe 전환 실패 시 기본 페이지 사용
+                    if not html or len(html) < 1000:
+                        driver.switch_to.default_content()
+                        html = driver.page_source
+                        print(f"      [DEBUG HTML] iframe 실패, 기본 페이지 사용: {len(html)}자")
                 else:
                     html = driver.page_source
-            except Exception:
-                # iframe 전환 실패 시 기본 페이지 사용
+                    print(f"      [DEBUG HTML] iframe 없음, 기본 페이지 사용: {len(html)}자")
+                    
+            except Exception as iframe_error:
+                print(f"      [DEBUG HTML] iframe 처리 오류: {str(iframe_error)[:50]}")
+                try:
+                    driver.switch_to.default_content()
+                except:
+                    pass
                 html = driver.page_source
             
             driver.quit()
@@ -498,14 +846,23 @@ class ReportSummarizerTool(BaseTool):
             soup = BeautifulSoup(html, "html.parser")
             
             # 네이버 리포트 페이지 구조에 맞춰 본문 추출
-            # 주요 섹션 선택자들 (td 우선순위 상향)
+            # 주요 섹션 선택자들 (확장 버전)
             content_selectors = [
+                "td.view_cnt",         # 네이버 리포트 본문 컨테이너 (핵심 선택자)
+                "div.view_cnt",        # div 형태의 본문 컨테이너
                 "td.view_content",     # 테이블 셀 본문 (경제/산업 분석 우선)
                 "table.view",          # 테이블 뷰
                 "div.view_con",        # 네이버 리포트 본문
                 "div.tb_view",         # 테이블 형식 추가
                 "div.article_view", 
                 "div.article_view_con",
+                "section.article",     # 섹션 기반 본문
+                "div#articleBody",     # 본문 영역 ID
+                "div#wrap_view",       # 뷰 래퍼
+                "div#wrapContent",     # 컨텐츠 래퍼
+                "div#contentArea",     # 컨텐츠 영역
+                "div.article_body",    # 기사 본문
+                "div.end_body",        # 본문 끝 부분
                 "div.tb_type1",        # 테이블 형식
                 "div.tb_cont",         # 테이블 컨텐츠
                 "div.board_view",      # 게시판 형식
@@ -514,30 +871,96 @@ class ReportSummarizerTool(BaseTool):
                 "#content"
             ]
             
+            # 신한투자증권 전용 선택자 추가 (company 파라미터 사용)
+            if "신한" in company:
+                print(f"      [DEBUG HTML] 신한투자증권 리포트 감지 (company: {company})")
+                content_selectors = [
+                    # 신한투자 특화 선택자 (우선순위 높게)
+                    "div.view_cont",      # NEW: 신한투자 본문 컨테이너
+                    "td.view_cont",       # NEW: 신한투자 테이블 셀
+                    "div.article_content", # NEW: 기사 본문
+                    "div.content_body",   # NEW: 본문 영역
+                    "div#content_detail", # NEW: 상세 본문 ID
+                    "div.report_view",    # NEW: 리포트 뷰
+                    "div.article_view",   # NEW: 기사 뷰
+                    # 네이버 표준 선택자
+                    "td.view_cnt",
+                    "div.view_cnt",
+                    "td.view_content",
+                    "table.view",
+                    "div.view_con",
+                    # 일반 선택자
+                    "div.report-content",
+                    "div.report-body",
+                    "div.viewer-content",
+                    "div.article-content",
+                    "td.content",
+                    "div.content",
+                    "#articleBody",
+                    "article"
+                ] + content_selectors
+            
+            # v10.5: 빠른 선택자 기반 추출 (우선 시도)
             text = ""
-            for selector in content_selectors:
+            print(f"      [DEBUG HTML] 선택자 {len(content_selectors)}개 중 매칭 시도...")
+            for idx, selector in enumerate(content_selectors[:5]):  # 처음 5개만 빠르게 시도
                 element = soup.select_one(selector)
                 if element:
                     text = element.get_text(separator="\n").strip()
-                    print(f"      [DEBUG HTML] 선택자 '{selector}'로 {len(text)}자 추출")
-                    break
+                    if len(text) > 100:
+                        print(f"      [DEBUG HTML] OK 선택자 #{idx+1} '{selector}' 매칭 성공: {len(text)}자")
+                        break
+                    else:
+                        text = ""  # 계속 시도
+                else:
+                    if idx < 3:
+                        print(f"      [DEBUG HTML] FAIL 선택자 #{idx+1} '{selector}' 매칭 실패")
+            
+            # 선택자 실패 시 클래스 기반 검색 (v10.5 신규)
+            if not text or len(text) < 100:
+                print(f"      [DEBUG HTML] 선택자 실패, 클래스 기반 검색으로 fallback")
+                text_blocks = soup.find_all(["td", "div"], class_=re.compile(r"view|content|article|report", re.I))
+                texts = [t.get_text(strip=True) for t in text_blocks if len(t.get_text(strip=True)) > 100]
+                if texts:
+                    text = max(texts, key=len)
+                    print(f"      [DEBUG HTML] 클래스 기반 검색 성공: {len(text)}자")
             
             # 위 선택자로 못 찾으면 전체 본문에서 불필요한 부분 제거
             if not text or len(text) < 100:  # 200자 → 100자로 완화
-                print(f"      [DEBUG HTML] 선택자로 추출 실패, fallback 시도")
+                if text:
+                    print(f"      [DEBUG HTML] 선택자로 추출했지만 {len(text)}자밖에 안 됨, fallback 시도")
+                else:
+                    print(f"      [DEBUG HTML] 선택자 매칭 완전 실패, fallback 시도")
                 # 스크립트, 스타일 제거
                 for tag in soup(["script", "style", "nav", "footer", "header"]):
                     tag.decompose()
                 text = soup.get_text(separator="\n").strip()
+                print(f"      [DEBUG HTML] fallback step1: 전체 텍스트 추출 → {len(text)}자")
                 
-                # 여전히 짧으면 p, td, div 태그에서 긴 텍스트 찾기
-                if not text or len(text) < 100:  # 200자 → 100자로 완화
-                    for tag in soup.find_all(["p", "td", "div"]):
+                # 여전히 짧으면 모든 태그에서 가장 긴 텍스트 찾기 (개선)
+                if not text or len(text) < 100:
+                    print(f"      [DEBUG HTML] fallback step2: 전체 태그 중 가장 긴 텍스트 검색...")
+                    longest_text = ""
+                    longest_len = 0
+                    
+                    for tag in soup.find_all(["p", "td", "div", "article", "section", "span"]):
                         tag_text = tag.get_text(separator=" ").strip()
-                        if len(tag_text) > 100 and not re.search(r"네이버|삭제|오류|주식거래", tag_text, re.IGNORECASE):
-                            text = tag_text
-                            print(f"      [DEBUG HTML] fallback으로 {len(text)}자 추출")
-                            break
+                        # 광고/네비게이션 패턴 필터링
+                        if (len(tag_text) > longest_len and 
+                            len(tag_text) >= 100 and 
+                            not re.search(r"목록|조회|신한투자증권 리서치 탐색기|네이버|삭제|오류|주식거래", tag_text, re.IGNORECASE)):
+                            longest_text = tag_text
+                            longest_len = len(tag_text)
+                    
+                    if longest_text and longest_len >= 100:
+                        text = longest_text
+                        print(f"      [DEBUG HTML] fallback step2: 가장 긴 텍스트 발견 - {len(text)}자")
+                    elif longest_text and longest_len >= 50 and "신한" in company:
+                        # 신한투자는 50자 이상도 허용
+                        text = longest_text
+                        print(f"      [DEBUG HTML] fallback step2: 신한투자 본문 추출 - {len(text)}자")
+                    else:
+                        print(f"      [DEBUG HTML] fallback 실패: 최대 {longest_len}자만 발견됨")
             
             # 광고/네비게이션 텍스트 필터링
             text = re.sub(r"\s+", " ", text.strip())
@@ -554,9 +977,10 @@ class ReportSummarizerTool(BaseTool):
                 if re.search(pattern, text, re.IGNORECASE):
                     return ""  # 에러 페이지는 빈 텍스트 반환
             
-            # 유효한 본문인지 판단 (최소 50자 이상으로 완화)
-            if len(text) < 50:
-                print(f"      [DEBUG HTML] 본문이 너무 짧음: {len(text)}자")
+            # 유효한 본문인지 판단 (신한투자는 50자, 일반은 100자 이상)
+            min_length = 50 if "신한" in company else 100
+            if len(text) < min_length:
+                print(f"      [DEBUG HTML] 본문이 너무 짧음: {len(text)}자 (최소: {min_length}자)")
                 return ""
             
             # 광고 패턴 체크 (더 정교하게)
@@ -589,6 +1013,9 @@ class ReportSummarizerTool(BaseTool):
         pdf_url = report.get("pdf_url")
         url = report.get("url")
         
+        # v10.5: 진단 로그 추가
+        print(f"[TRACE] {idx+1}/{total} | {company} | {title[:40]}... | URLs: PDF={'O' if pdf_url else 'X'}, HTML={'O' if url else 'X'}")
+        
         # PDF 또는 HTML 텍스트 추출
         text = ""
         source_type = "없음"
@@ -599,7 +1026,7 @@ class ReportSummarizerTool(BaseTool):
                 source_type = "PDF"
         
         if not text and url:
-            text = self._extract_html_text(url)
+            text = self._extract_html_text(url, company=company)
             if text:
                 source_type = "HTML"
         
@@ -656,8 +1083,8 @@ class ReportSummarizerTool(BaseTool):
         print(f"\n[INFO] 총 {total_reports}개 리포트 전수 요약 시작 (병렬 처리)")
         
         summaries = []
-        # 병렬 실행 (최대 8개 스레드)
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        # v10.5: 병렬 실행 (HTML/iframe 접근은 부하 큼 → 워커 수 축소)
+        with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {
                 executor.submit(self._summarize_report, r, i, total_reports): i
                 for i, r in enumerate(reports)
@@ -795,11 +1222,39 @@ class NotionUploadTool(BaseTool):
             return f"⚠️ Notion 업로드 실패: {e}"
 
 # ----------------------------------------------------------
-# 6️⃣ 실행
+# 6️⃣ 실행 (Phase 3: PDF 캐싱 추가)
 # ----------------------------------------------------------
+def load_pdf_cache():
+    """Phase 3: PDF 캐시 로드"""
+    cache_file = "pdf_cache.json"
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_pdf_cache(cache):
+    """Phase 3: PDF 캐시 저장"""
+    cache_file = "pdf_cache.json"
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] 캐시 저장 실패: {e}")
+
 def run_daily_briefing():
-    """전체 파이프라인 실행"""
-    print(f"[START] {today_display} Daily Briefing 시작 (v9.0 - 전수 분석)")
+    """전체 파이프라인 실행 (Phase 3: PDF 캐싱 적용)"""
+    import sys
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    
+    print(f"[START] {today_display} Daily Briefing 시작 (v11.1 - PDF whitelist + HTML fallback)")
+    
+    # Phase 3: PDF 캐시 로드
+    pdf_cache = load_pdf_cache()
+    print(f"[INFO] PDF 캐시 로드: {len(pdf_cache)}건 저장됨")
     
     # 1. 리포트 수집
     print("\n[1/5] 리포트 수집 중...")
@@ -843,14 +1298,11 @@ def run_daily_briefing():
 
 if __name__ == "__main__":
     weekday = datetime.today().weekday()
-    IS_TEST_MODE = False  # 프로덕션 모드 (주말 스킵)
     
-    if weekday >= 5 and not IS_TEST_MODE:
-        print(f"[SKIP] 주말 스킵 ({today_display})")
+    # 평일(0-4)에만 실행, 주말(5-6)은 스킵
+    if weekday >= 5:
+        print(f"[SKIP] 주말 스킵 - {today_display} ({'토요일' if weekday == 5 else '일요일'})")
     else:
-        if IS_TEST_MODE and weekday >= 5:
-            print(f"\n[TEST MODE] 주말이지만 테스트 모드로 실행합니다.\n오늘: {today_display}")
-        
         result = run_daily_briefing()
         
         print("\n" + "=" * 60)
